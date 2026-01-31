@@ -1,13 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-log() {
-  printf "[*] %s\n" "$*"
-}
-
-warn() {
-  printf "[!] %s\n" "$*" >&2
-}
+log() { printf "[*] %s\n" "$*"; }
+warn() { printf "[!] %s\n" "$*" >&2; }
 
 show_help() {
   cat <<'EOF'
@@ -15,30 +10,20 @@ Usage:
   rec-nmap-ip-range.sh [OPTIONS] <target> [outdir]
 
 Targets:
-  CIDR            10.0.10.0/24
-  Range           10.0.10.1-50
-  Single IP       10.0.10.5
-  File            targets.txt   (one target/range per line)
+  CIDR / range / single IP / targets.txt (one target per line)
 
 Options:
-  -h, --help      Show this help message and exit
+  -h, --help      Show help and exit
 
 Environment variables:
   RATE            Nmap --min-rate (default: 2000)
-  NMAP_EXTRA      Extra nmap flags
+  NMAP_EXTRA      Extra nmap flags (optional)
 
-Examples:
+Example:
   proxychains4 -q ./rec-nmap-ip-range.sh targets.txt
-  RATE=1000 NMAP_EXTRA="--host-timeout 60s" proxychains4 -q ./rec-nmap-ip-range.sh 10.0.10.0/24
-
-Nmap flags used:
-  -sT -Pn --top-ports 200 -sV --version-light --open
 EOF
 }
 
-# -----------------------------
-# Help flag
-# -----------------------------
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   show_help
   exit 0
@@ -46,9 +31,7 @@ fi
 
 TARGET="${1:-}"
 OUTDIR="${2:-out}"
-
 [[ -z "$TARGET" ]] && { warn "Missing target"; show_help; exit 1; }
-
 command -v nmap >/dev/null 2>&1 || { warn "nmap not installed"; exit 1; }
 
 RATE="${RATE:-2000}"
@@ -56,31 +39,32 @@ NMAP_EXTRA="${NMAP_EXTRA:-}"
 
 mkdir -p "$OUTDIR"
 SUMMARY="$OUTDIR/summary.csv"
-echo "ip,port,proto,state,service,info" > "$SUMMARY"
+NMAP_LOG="$OUTDIR/_nmap.log"
+CLEAN_TARGET="$OUTDIR/_targets.clean.txt"
 
-# -----------------------------
-# Target handling
-# -----------------------------
+echo "ip,port,proto,state,service,info" > "$SUMMARY"
+: > "$NMAP_LOG"
+
+# Sanitize targets into a clean file (supports ranges/CIDR per line)
 if [[ -f "$TARGET" ]]; then
   log "Loading targets from file: $TARGET"
-  NMAP_TARGET_ARGS=(-iL "$TARGET")
+  awk '
+    { gsub(/\r/,""); sub(/^[ \t]+/,""); sub(/[ \t]+$/,""); }
+    $0=="" { next }
+    $0 ~ /^#/ { next }
+    { print }
+  ' "$TARGET" > "$CLEAN_TARGET"
+  log "Sanitized targets saved: $CLEAN_TARGET"
+  NMAP_TARGET_ARGS=(-iL "$CLEAN_TARGET")
 else
   log "Using direct target expression: $TARGET"
   NMAP_TARGET_ARGS=("$TARGET")
 fi
 
-TMP_GNMAP="$OUTDIR/_scan.gnmap"
-
-log "Output directory : $OUTDIR"
-log "Scan type        : TCP connect (-sT)"
-log "Top ports        : 200"
-log "Version detect   : light"
-log "Min rate         : $RATE"
 log "Starting nmap scan..."
+log "Flags: -sT -Pn --top-ports 200 -sV --version-light --open --min-rate $RATE"
 
-# -----------------------------
-# Run nmap (proxychains wraps this)
-# -----------------------------
+# Run nmap and capture normal output (this is what we will parse)
 nmap \
   -sT -Pn \
   --top-ports 200 \
@@ -88,75 +72,118 @@ nmap \
   --open \
   --min-rate "$RATE" \
   $NMAP_EXTRA \
-  -oG "$TMP_GNMAP" \
-  "${NMAP_TARGET_ARGS[@]}"
+  "${NMAP_TARGET_ARGS[@]}" 2>&1 | tee "$NMAP_LOG" >/dev/null
 
 log "Nmap scan completed"
-log "Parsing results..."
+log "Parsing: $NMAP_LOG"
 
 host_count=0
 port_count=0
 
-# -----------------------------
-# Parse gnmap output
-# -----------------------------
-while IFS= read -r line; do
-  [[ "$line" == Host:* ]] || continue
-  [[ "$line" == *"Ports:"* ]] || continue
+# Parse normal output into per-IP blocks and port lines
+awk -v outdir="$OUTDIR" -v summary="$SUMMARY" '
+function trim(s){ sub(/^[ \t]+/,"",s); sub(/[ \t]+$/,"",s); return s }
 
-  ip="$(awk '{print $2}' <<<"$line")"
-  ports_field="${line#*Ports: }"
+BEGIN {
+  ip=""
+  in_ports=0
+  buf=""
+}
 
-  log "Processing host: $ip"
+# Start of a host section:
+# "Nmap scan report for NAME (IP)"
+# or: "Nmap scan report for IP"
+$0 ~ /^Nmap scan report for / {
+  # Flush previous host if needed
+  if (ip != "") {
+    # write buffered nmap text
+    if (buf != "") {
+      hostdir = outdir "/" ip
+      system("mkdir -p \"" hostdir "\"")
+      nmapfile = hostdir "/nmap.txt"
+      print buf > nmapfile
+      close(nmapfile)
+    }
+  }
 
-  entries="$(
-    awk -v s="$ports_field" 'BEGIN{
-      n=split(s,a,",");
-      for(i=1;i<=n;i++){
-        gsub(/^ +| +$/,"",a[i]);
-        split(a[i],b,"/");
-        port=b[1]; state=b[2]; proto=b[3]; service=b[5]; info=b[7];
-        if(service=="") service="-";
-        if(info=="") info="-";
-        if(state=="open" && proto=="tcp"){
-          print port "/" proto " " state " " service " " info;
-        }
-      }
-    }'
-  )"
+  buf = $0 "\n"
+  in_ports = 0
 
-  if [[ -z "$entries" ]]; then
-    warn "No open TCP ports found for $ip"
-    continue
-  fi
+  # Extract IP:
+  # If line has "(x.x.x.x)" use that; else last field is IP
+  if (match($0, /\(([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\)/, m)) {
+    ip = m[1]
+  } else {
+    # last token
+    n = split($0, a, " ")
+    ip = a[n]
+  }
 
-  hostdir="$OUTDIR/$ip"
-  mkdir -p "$hostdir"
-  ((host_count++))
+  next
+}
 
-  echo "$line" > "$hostdir/nmap.txt"
+# Collect lines for the current host block
+ip != "" {
+  buf = buf $0 "\n"
+}
 
-  {
-    echo "$ip"
-    echo "$entries"
-  } > "$hostdir/open-ports.txt"
+# Detect port table header
+ip != "" && $0 ~ /^PORT[ \t]+STATE[ \t]+SERVICE/ {
+  in_ports = 1
+  next
+}
 
-  while IFS= read -r e; do
-    portproto="$(awk '{print $1}' <<<"$e")"
-    state="$(awk '{print $2}' <<<"$e")"
-    service="$(awk '{print $3}' <<<"$e")"
-    info="$(cut -d' ' -f4- <<<"$e")"
-    port="${portproto%/*}"
-    proto="${portproto#*/}"
-    printf "%s,%s,%s,%s,%s,\"%s\"\n" \
-      "$ip" "$port" "$proto" "$state" "$service" "$info" >> "$SUMMARY"
-    ((port_count++))
-    log "  → $port/$proto $service"
-  done <<< "$entries"
+# End port table when we hit an empty line or a non port line
+ip != "" && in_ports == 1 {
+  if ($0 ~ /^$/) { in_ports = 0; next }
 
-done < "$TMP_GNMAP"
+  # Port line example:
+  # 53/tcp open  domain  dnsmasq 2.89
+  # 443/tcp open  ssl/http nginx
+  if (match($0, /^([0-9]+)\/(tcp|udp)[ \t]+([a-zA-Z|]+)[ \t]+([^ \t]+)[ \t]*(.*)$/, p)) {
+    port = p[1]
+    proto = p[2]
+    state = p[3]
+    service = p[4]
+    info = trim(p[5])
+    if (info == "") info = "-"
 
-log "Recon finished"
-log "Hosts with open ports : $host_count"
-log "Total open ports      : $port_count"
-log "Summary CSV           : $SUMMARY"
+    hostdir = outdir "/" ip
+    system("mkdir -p \"" hostdir "\"")
+
+    openfile = hostdir "/open-ports.txt"
+
+    # If file doesn’t exist yet, write the IP header first
+    # (awk can’t easily test existence portably; just write header once per host using a flag)
+    if (!(ip in wrote_header)) {
+      print ip > openfile
+      wrote_header[ip] = 1
+    }
+
+    print port "/" proto " " state " " service " " info >> openfile
+    close(openfile)
+
+    # summary csv
+    gsub(/"/, "\"\"", info)
+    printf "%s,%s,%s,%s,%s,\"%s\"\n", ip, port, proto, state, service, info >> summary
+  }
+}
+
+END {
+  # Flush last host block
+  if (ip != "" && buf != "") {
+    hostdir = outdir "/" ip
+    system("mkdir -p \"" hostdir "\"")
+    nmapfile = hostdir "/nmap.txt"
+    print buf > nmapfile
+    close(nmapfile)
+  }
+}
+' "$NMAP_LOG"
+
+# Remove empty folders (in case any were created without ports)
+find "$OUTDIR" -mindepth 1 -maxdepth 1 -type d -empty -print -delete >/dev/null 2>&1 || true
+
+log "Done"
+log "Summary CSV: $SUMMARY"
+log "Per-host folders: $OUTDIR/<ip>/"
