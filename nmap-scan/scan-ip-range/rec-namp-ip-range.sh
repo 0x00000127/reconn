@@ -4,33 +4,67 @@ set -euo pipefail
 # ============================================
 # Proxychains-safe Nmap Open Port Scanner
 # ============================================
-# Usage:
-#   proxychains4 -q ./scan-open-ports.sh 10.0.10.0/24
-#   proxychains4 -q ./scan-open-ports.sh 10.0.10.1-50
-#   proxychains4 -q ./scan-open-ports.sh targets.txt
-#
-# Output:
-#   out/<ip>/open-ports.txt
-#   out/<ip>/nmap.txt
-#   out/summary.csv
-# ============================================
+
+show_help() {
+  cat <<'EOF'
+Usage:
+  scan-open-ports.sh [OPTIONS] <target> [outdir]
+
+Targets:
+  CIDR            10.0.10.0/24
+  Range           10.0.10.1-50
+  Single IP       10.0.10.5
+  File            targets.txt   (one target per line)
+
+Options:
+  -h, --help      Show this help message and exit
+
+Environment variables:
+  PORTS           Port range to scan (default: 1-65535)
+  RATE            Nmap --min-rate value (default: 2000)
+  NMAP_EXTRA      Extra nmap flags
+                  (default: --max-retries 2 --host-timeout 30s --scan-delay 200ms)
+
+Examples:
+  proxychains4 -q ./scan-open-ports.sh 10.0.10.0/24
+  PORTS=1-1000 proxychains4 -q ./scan-open-ports.sh targets.txt
+  RATE=1000 NMAP_EXTRA="--max-retries 1" proxychains4 -q ./scan-open-ports.sh 1.2.3.4
+
+Output:
+  out/<ip>/open-ports.txt
+  out/<ip>/nmap.txt
+  out/summary.csv
+EOF
+}
+
+# -----------------------------
+# Arg parsing
+# -----------------------------
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  show_help
+  exit 0
+fi
 
 TARGET="${1:-}"
 OUTDIR="${2:-out}"
 
-# Tor / proxy-safe defaults
+# -----------------------------
+# Defaults (Tor / proxy safe)
+# -----------------------------
 PORTS="${PORTS:-1-65535}"
 RATE="${RATE:-2000}"
-SCAN_TYPE="-sT"   # FORCE TCP connect scan (required for proxychains)
+SCAN_TYPE="-sT"   # REQUIRED for proxychains
 NMAP_EXTRA="${NMAP_EXTRA:---max-retries 2 --host-timeout 30s --scan-delay 200ms}"
 
 if [[ -z "$TARGET" ]]; then
-  echo "Usage: $0 <ip-range|cidr|targets.txt> [outdir]"
+  echo "[-] Missing target"
+  echo
+  show_help
   exit 1
 fi
 
 if ! command -v nmap >/dev/null 2>&1; then
-  echo "nmap not found. Install it first."
+  echo "[-] nmap not found. Install it first."
   exit 1
 fi
 
@@ -38,8 +72,9 @@ mkdir -p "$OUTDIR"
 SUMMARY="$OUTDIR/summary.csv"
 echo "ip,open_ports" > "$SUMMARY"
 
+# -----------------------------
 # Target handling
-NMAP_TARGET_ARGS=()
+# -----------------------------
 if [[ -f "$TARGET" ]]; then
   NMAP_TARGET_ARGS=(-iL "$TARGET")
 else
@@ -48,15 +83,15 @@ fi
 
 TMP_GNMAP="$OUTDIR/_scan.gnmap"
 
-echo "[*] Target      : $TARGET"
-echo "[*] Output dir : $OUTDIR"
-echo "[*] Ports      : $PORTS"
-echo "[*] Scan type  : TCP connect (-sT)"
-echo "[*] Rate       : $RATE"
+echo "[*] Target     : $TARGET"
+echo "[*] Output dir: $OUTDIR"
+echo "[*] Ports     : $PORTS"
+echo "[*] Rate      : $RATE"
+echo "[*] Scan type : TCP connect (-sT)"
 echo
 
 # -----------------------------
-# Run Nmap (proxychains wraps this)
+# Run scan (proxychains wraps this)
 # -----------------------------
 nmap -n -Pn $SCAN_TYPE --open \
   -p "$PORTS" \
@@ -91,21 +126,15 @@ while IFS= read -r line; do
   hostdir="$OUTDIR/$ip"
   mkdir -p "$hostdir"
 
-  # Open ports list
   {
     echo "$ip"
     echo "$open_ports" | tr ',' '\n'
   } > "$hostdir/open-ports.txt"
 
-  # Raw nmap line
   echo "$line" > "$hostdir/nmap.txt"
-
-  # Summary
   echo "$ip,\"$open_ports\"" >> "$SUMMARY"
 
 done < "$TMP_GNMAP"
 
 echo "[*] Done"
 echo "[*] Summary: $SUMMARY"
-echo "[*] Hosts with open ports:"
-cut -d, -f1 "$SUMMARY" | tail -n +2

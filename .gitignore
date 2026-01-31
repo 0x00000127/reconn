@@ -1,2 +1,2 @@
 # dist folder is designated to link scripts and tool in the same folder 
-./dist/
+dist/**
